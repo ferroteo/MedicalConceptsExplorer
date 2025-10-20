@@ -11,6 +11,8 @@ import pickle
 import json
 from pathlib import Path
 import warnings
+import multiprocessing as mp
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -33,6 +35,12 @@ ICD10_FILE_PATH = "/home/mattferr/Projects/EmbeddingComparisons/icd10_codes.csv"
 # Device setup
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+print(f"CPU cores available: {mp.cpu_count()}")
+print(f"CPU threads available: {os.cpu_count()}")
+
+# Set number of threads for PyTorch
+torch.set_num_threads(mp.cpu_count())
+print(f"PyTorch using {torch.get_num_threads()} threads")
 
 
 def load_icd10_codes(filepath):
@@ -55,7 +63,7 @@ def load_icd10_codes(filepath):
     return combined_input
 
 
-def get_transformer_embeddings(texts, model, tokenizer, batch_size=8):
+def get_transformer_embeddings(texts, model, tokenizer, batch_size=64):
     """Generate embeddings using transformer models"""
     all_embeddings = []
     model.eval()
@@ -103,14 +111,19 @@ def precompute_embeddings_for_model(model_name, combined_input):
         model = AutoModel.from_pretrained(config['model']).to(device)
         
         print("Generating embeddings for combined text...")
-        combined_input_embeddings = get_transformer_embeddings(combined_input, model, tokenizer)
+        combined_input_embeddings = get_transformer_embeddings(combined_input, model, tokenizer, batch_size=64)
         
     elif config['type'] == 'sentence_transformer':
         print(f"Loading {model_name}...")
         model = SentenceTransformer(config['path'])
         
         print("Generating embeddings for combined text...")
-        combined_input_embeddings = model.encode(combined_input, show_progress_bar=True, convert_to_numpy=True)
+        combined_input_embeddings = model.encode(
+            combined_input, 
+            batch_size=64,
+            show_progress_bar=True, 
+            convert_to_numpy=True
+        )
     
     return combined_input_embeddings
 
@@ -138,11 +151,14 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
     
     # Process each model
+    import time
     for model_name in MODELS_CONFIG.keys():
         try:
+            start_time = time.time()
             embeddings = precompute_embeddings_for_model(model_name, combined_input)
             save_embeddings(model_name, embeddings)
-            print(f"✓ Successfully processed {model_name}")
+            elapsed = time.time() - start_time
+            print(f"✓ Successfully processed {model_name} in {elapsed:.2f} seconds")
         except Exception as e:
             print(f"✗ Error processing {model_name}: {str(e)}")
             continue

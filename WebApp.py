@@ -11,6 +11,8 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoModel, AutoTokenizer
 from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.manifold import TSNE
+import altair as alt
 
 # Configuration
 CONFIG_FILE = './models/config.json'
@@ -100,7 +102,29 @@ def find_similar_codes(user_text, model_name, config, icd_data, icd_embeddings, 
         'CombinedCodeDescription': icd_data.iloc[top_indices]['combined_input'].values,
         'Similarity': similarities[top_indices]
     })
-    return results
+    return results, user_embedding
+
+
+def compute_tsne(icd_embeddings, user_embedding, icd_data, user_text):
+    """Compute t-SNE with ICD embeddings and query embedding, include code labels"""
+    all_emb = np.vstack([icd_embeddings, user_embedding])
+    tsne = TSNE(n_components=2, perplexity=30, learning_rate='auto', init='random', random_state=42)
+    coords = tsne.fit_transform(all_emb)
+
+    df_icd = pd.DataFrame({
+        'x': coords[:-1, 0],
+        'y': coords[:-1, 1],
+        'type': 'ICD',
+        'label': icd_data['combined_input'].values
+    })
+    df_query = pd.DataFrame({
+        'x': [coords[-1, 0]],
+        'y': [coords[-1, 1]],
+        'type': 'QUERY',
+        'label': [user_text]
+    })
+    df_vis = pd.concat([df_icd, df_query], ignore_index=True)
+    return df_vis
 
 
 def main():
@@ -142,7 +166,14 @@ def main():
     if search_button and user_input.strip():
         try:
             with st.spinner("Computing similarities..."):
-                results = find_similar_codes(user_input, model_name, config, icd_data, icd_embeddings, top_n)
+                results, user_embedding = find_similar_codes(
+                    user_input,
+                    model_name,
+                    config,
+                    icd_data,
+                    icd_embeddings,
+                    top_n
+                )
         except Exception as e:
             st.error(f"❌ Error during similarity computation: {str(e)}")
             return
@@ -170,6 +201,33 @@ def main():
 
         csv = results.to_csv(index=False)
         st.download_button("📥 Download Results as CSV", csv, "icd10_similarity_results.csv", "text/csv")
+
+        st.markdown("### 🗺️ Embedding Space (t-SNE)")
+
+        with st.spinner("Projecting embeddings with t-SNE..."):
+            tsne_df = compute_tsne(icd_embeddings, user_embedding, icd_data, user_input)
+
+        tsne_df['size'] = np.where(tsne_df['type'] == 'QUERY', 200, 70)
+
+        chart = (
+            alt.Chart(tsne_df)
+            .mark_circle()
+            .encode(
+                x=alt.X("x:Q", title="t-SNE 1"),
+                y=alt.Y("y:Q", title="t-SNE 2"),
+                color=alt.Color(
+                    "type:N",
+                    scale=alt.Scale(domain=["ICD", "QUERY"], range=["steelblue", "red"]),
+                    legend=alt.Legend(title="Point Type")
+                ),
+                size=alt.Size("size:Q", legend=None),
+                tooltip=[alt.Tooltip("label:N", title="Description")]
+            )
+            .interactive()
+            .properties(width=800, height=600)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
 
     elif search_button and not user_input.strip():
         st.warning("⚠️ Please enter some clinical text to search")

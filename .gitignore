@@ -1,0 +1,10 @@
+*
+!data
+!data/**
+!models/config.json
+!.gitignore
+!initialize.sh
+!PreComputeEmbeddings.py
+!README.md
+!requirements.txt
+!WebApp.py

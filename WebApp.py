@@ -6,29 +6,30 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import torch
+import json
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModel, AutoTokenizer
 from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Configuration
-MODELS_CONFIG = {
-    'gatortron': {
-        'tokenizer': 'UFNLP/gatortron-base',
-        'model': 'UFNLP/gatortron-base',
-        'type': 'transformer'
-    },
-    'bridge': {
-        'path': '/home/mattferr/Projects/EmbeddingComparisons/Embedding-SBERT-CLIP-256-Full-woGraph-woCandidate-STRONG/sbert/',
-        'type': 'sentence_transformer'
-    }
-}
-
+CONFIG_FILE = './models/config.json'
 EMBEDDINGS_DIR = Path('precomputed_embeddings')
-ICD10_FILE_PATH = "/home/mattferr/Projects/EmbeddingComparisons/icd10_codes.csv"
+ICD10_FILE_PATH = "./data/icd10_codes.csv"
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
+def load_config():
+    """Load model configuration from JSON file"""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+        return config.get('MODELS_CONFIG', {})
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Configuration file '{CONFIG_FILE}' not found")
+    except json.JSONDecodeError:
+        raise ValueError(f"Configuration file '{CONFIG_FILE}' is not valid JSON")
 
 @st.cache_data
 def load_icd10_codes(icd_chars=3):
@@ -51,11 +52,11 @@ def load_embeddings(model_name, icd_chars):
 
 
 @st.cache_resource
-def load_model(model_name):
+def load_model(model_name, config):
     """Load model if available"""
-    if model_name not in MODELS_CONFIG:
+    if model_name not in config:
         raise ValueError(f"Model '{model_name}' not found in configuration.")
-    config = MODELS_CONFIG[model_name]
+    config = config[model_name]
 
     if config['type'] == 'transformer':
         tokenizer = AutoTokenizer.from_pretrained(config['tokenizer'])
@@ -88,9 +89,9 @@ def get_user_embedding(text, model_dict):
         return model.encode([text], convert_to_numpy=True)
 
 
-def find_similar_codes(user_text, model_name, icd_data, icd_embeddings, top_n=10):
+def find_similar_codes(user_text, model_name, config, icd_data, icd_embeddings, top_n=10):
     """Compute cosine similarities and return ranked ICD codes"""
-    model_dict = load_model(model_name)
+    model_dict = load_model(model_name, config)
     user_embedding = get_user_embedding(user_text, model_dict)
     similarities = cosine_similarity(user_embedding, icd_embeddings)[0]
     top_indices = np.argsort(similarities)[::-1][:top_n]
@@ -107,9 +108,11 @@ def main():
     st.title("🏥 ICD-10-CM Code Finder")
     st.markdown("Find the most similar ICD-10-CM codes based on clinical text")
 
+    config = load_config()
+
     # Sidebar
     st.sidebar.header("Settings")
-    model_name = st.sidebar.selectbox("Select Model", options=list(MODELS_CONFIG.keys()), index=0)  # default gatortron
+    model_name = st.sidebar.selectbox("Select Model", options=list(config.keys()), index=0)  # default gatortron
     icd_chars = st.sidebar.number_input("ICD Code Length", min_value=3, max_value=7, value=3, step=1)
     top_n = st.sidebar.slider("Number of Results", min_value=1, max_value=50, value=10)
 
@@ -139,7 +142,7 @@ def main():
     if search_button and user_input.strip():
         try:
             with st.spinner("Computing similarities..."):
-                results = find_similar_codes(user_input, model_name, icd_data, icd_embeddings, top_n)
+                results = find_similar_codes(user_input, model_name, config, icd_data, icd_embeddings, top_n)
         except Exception as e:
             st.error(f"❌ Error during similarity computation: {str(e)}")
             return

@@ -42,6 +42,13 @@ def load_config():
         raise ValueError(f"Configuration file '{CONFIG_FILE}' is not valid JSON")
 
 
+def check_embeddings_exist(model_name, icd_chars):
+    """Check if embeddings already exist for this model and ICD character length"""
+    model_dir = OUTPUT_DIR / model_name / f"icd{icd_chars}"
+    embeddings_file = model_dir / 'embeddings.parquet'
+    return embeddings_file.exists()
+
+
 def load_icd10_codes(filepath, icd_chars=3):
     """Load ICD-10-CM codes filtered by character length"""
     print(f"Loading ICD-10 codes from {filepath}...")
@@ -310,7 +317,29 @@ def main():
             print(f"Available models: {list(MODELS_CONFIG.keys())}")
             return
     
-    # Load ICD-10 codes
+    # Check for existing embeddings and filter models to process
+    print("\nChecking for existing embeddings...")
+    models_to_skip = []
+    models_to_compute = []
+    
+    for model_name in models_to_process:
+        if check_embeddings_exist(model_name, args.icd_chars):
+            models_to_skip.append(model_name)
+            print(f"  ✓ {model_name}: Embeddings already exist (skipping)")
+        else:
+            models_to_compute.append(model_name)
+            print(f"  • {model_name}: Will compute embeddings")
+    
+    if not models_to_compute:
+        print("\n" + "="*80)
+        print("All requested embeddings already exist. Nothing to compute.")
+        print(f"Embeddings location: {OUTPUT_DIR.absolute()}")
+        print("="*80)
+        return
+    
+    print(f"\nModels to compute: {len(models_to_compute)}/{len(models_to_process)}")
+    
+    # Load ICD-10 codes only if we have models to process
     combined_input = load_icd10_codes(ICD10_FILE_PATH, args.icd_chars)
     
     if len(combined_input) == 0:
@@ -322,7 +351,7 @@ def main():
     
     # Process each model
     import time
-    for model_name in models_to_process:
+    for model_name in models_to_compute:
         try:
             start_time = time.time()
             embeddings = precompute_embeddings_for_model(
@@ -343,6 +372,8 @@ def main():
     print("\n" + "="*80)
     print("Pre-computation complete!")
     print(f"Embeddings saved to: {OUTPUT_DIR.absolute()}")
+    if models_to_skip:
+        print(f"Skipped {len(models_to_skip)} model(s) with existing embeddings: {models_to_skip}")
     print("="*80)
 
 

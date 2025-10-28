@@ -1,0 +1,13 @@
+{
+  "MODELS_CONFIG": {
+    "gatortron": {
+      "tokenizer": "UFNLP/gatortron-base",
+      "model": "UFNLP/gatortron-base",
+      "type": "transformer"
+    },
+    "bridge": {
+      "path": "./models/Embedding-SBERT-CLIP-256-Full-woGraph-woCandidate-STRONG/sbert/",
+      "type": "sentence_transformer"
+    }
+  }
+}

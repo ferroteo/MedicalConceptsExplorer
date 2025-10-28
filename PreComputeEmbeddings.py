@@ -4,6 +4,7 @@ Pre-compute embeddings for ICD-10 codes and save them to disk.
 
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModel, AutoTokenizer
+from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import torch
@@ -142,7 +143,7 @@ def get_transformer_embeddings(texts, model, tokenizer, batch_size=64):
     all_embeddings = []
     model.eval()
 
-    for i in range(0, len(texts), batch_size):
+    for i in tqdm(range(0, len(texts), batch_size), desc='Embedding Texts'):
         batch_texts = texts[i:i+batch_size]
         encoded = tokenizer(
             batch_texts,
@@ -163,9 +164,6 @@ def get_transformer_embeddings(texts, model, tokenizer, batch_size=64):
         mean_pooled = summed / counts
 
         all_embeddings.append(mean_pooled.numpy())
-
-        if (i // batch_size + 1) % 10 == 0:
-            print(f"  Processed {i + len(batch_texts)}/{len(texts)} texts")
 
     return np.vstack(all_embeddings)
 

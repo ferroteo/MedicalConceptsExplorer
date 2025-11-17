@@ -1,10 +1,14 @@
+# Ignore everything by default
 *
-!data
-!data/**
+
+# Include configuration files
 !models/config.json
-!.gitignore
-!initialize.sh
-!PreComputeEmbeddings.py
 !README.md
 !requirements.txt
+
+# Include script files
+!PreComputeEmbeddings.py
 !WebApp.py
+
+# Include the .gitignore file itself
+!.gitignore

@@ -78,9 +78,10 @@ def load_concepts(filepath, vocabulary='OMOP'):
     codes = concepts_df['code'].tolist()
     # names = concepts_df['name'].tolist()
     
-    # combined_input = [f"[{vocab}: {code}, {name}]" for vocab, code, name in zip(concepts_df['vocabulary'], codes, names)]
+    text_input = [f"[{vocab}: {code}]" for vocab, code in zip(concepts_df['vocabulary'], codes)]
+    # text_input = [f"[{vocab}: {code}, {name}]" for vocab, code, name in zip(concepts_df['vocabulary'], codes, names)]
     # text_input = names
-    text_input = codes
+    # text_input = codes
     
     print(f"Loaded {len(text_input)} unique concepts from vocabulary '{vocabulary}'")
     return text_input

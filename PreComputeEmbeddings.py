@@ -1,5 +1,6 @@
 """
 Pre-compute embeddings for biomedical concept codes and save them to disk.
+Supports multiple vocabularies and models.
 """
 
 from sentence_transformers import SentenceTransformer
@@ -18,7 +19,7 @@ import argparse
 warnings.filterwarnings('ignore')
 
 CONFIG_FILE = './models/config.json'
-CONCEPTS_FILE_PATH = "./concept_bridge.parquet"
+CONCEPTS_FILE_PATH = "./data/concepts_bridge_appsubset.parquet"
 OUTPUT_DIR = Path('./embeddings')
 
 cpu_cores = os.cpu_count()
@@ -45,6 +46,16 @@ def check_embeddings_exist(model_name, vocabulary):
     model_dir = OUTPUT_DIR / model_name / vocabulary
     embeddings_file = model_dir / 'embeddings.npy'
     return embeddings_file.exists()
+
+
+def get_available_vocabularies(filepath):
+    """Get all unique vocabularies from the concepts file"""
+    try:
+        concepts_df = pd.read_parquet(filepath)
+        return sorted(concepts_df['vocabulary'].unique().tolist())
+    except Exception as e:
+        print(f"Warning: Could not read vocabularies from {filepath}: {e}")
+        return []
 
 
 def load_concepts(filepath, vocabulary='OMOP'):
@@ -237,8 +248,10 @@ def parse_arguments():
 Examples:
   python PreComputeEmbeddings.py
   python PreComputeEmbeddings.py --model bridge --vocabulary ICD10CM
-  python PreComputeEmbeddings.py --model all --vocabulary OMOP --parallel
+  python PreComputeEmbeddings.py --model all --vocabulary OMOP ATC ICD10CM --parallel
   python PreComputeEmbeddings.py --model bridge gatortron --vocabulary ATC --no-parallel
+  python PreComputeEmbeddings.py --vocabulary all --model bridge
+  python PreComputeEmbeddings.py --model all --vocabulary all --parallel
         """
     )
     
@@ -251,9 +264,9 @@ Examples:
     
     parser.add_argument(
         '--vocabulary',
-        type=str,
-        default='OMOP',
-        help='Vocabulary to filter concepts (default: OMOP)'
+        nargs='+',
+        default=['OMOP'],
+        help='Vocabulary/vocabularies to filter concepts. Use "all" for all vocabularies, or specify vocabulary names (default: OMOP)'
     )
     
     parser.add_argument(
@@ -280,13 +293,14 @@ def main():
     print("Biomedical Concept Embedding Pre-computation Pipeline")
     print("="*80)
     print(f"Configuration:")
-    print(f"  - Vocabulary: {args.vocabulary}")
+    print(f"  - Vocabularies: {args.vocabulary}")
     print(f"  - Parallel Processing: {args.parallel}")
     print(f"  - Requested Models: {args.model}")
     print("="*80)
     
     MODELS_CONFIG = load_config()
     
+    # Handle model selection
     if 'all' in args.model:
         models_to_process = list(MODELS_CONFIG.keys())
         print(f"Processing all available models: {models_to_process}")
@@ -302,38 +316,75 @@ def main():
             print(f"Available models: {list(MODELS_CONFIG.keys())}")
             return
     
+    # Handle vocabulary selection
+    available_vocabularies = get_available_vocabularies(CONCEPTS_FILE_PATH)
+    
+    if 'all' in args.vocabulary:
+        vocabularies_to_process = available_vocabularies
+        print(f"\nProcessing all available vocabularies: {vocabularies_to_process}")
+    else:
+        vocabularies_to_process = args.vocabulary
+        invalid_vocabs = [v for v in vocabularies_to_process if v not in available_vocabularies]
+        if invalid_vocabs:
+            print(f"\nWarning: Unknown vocabularies will be skipped: {invalid_vocabs}")
+            print(f"Available vocabularies: {available_vocabularies}")
+        vocabularies_to_process = [v for v in vocabularies_to_process if v in available_vocabularies]
+        
+        if not vocabularies_to_process:
+            print("Error: No valid vocabularies specified")
+            print(f"Available vocabularies: {available_vocabularies}")
+            return
+    
+    print(f"\nVocabularies to process: {vocabularies_to_process}")
+    
+    # Check for existing embeddings
     print("\nChecking for existing embeddings...")
-    models_to_skip = []
-    models_to_compute = []
+    tasks_to_skip = []
+    tasks_to_compute = []
     
     for model_name in models_to_process:
-        if check_embeddings_exist(model_name, args.vocabulary):
-            models_to_skip.append(model_name)
-            print(f"  ✓ {model_name}: Embeddings already exist (skipping)")
-        else:
-            models_to_compute.append(model_name)
-            print(f"  • {model_name}: Will compute embeddings")
+        for vocabulary in vocabularies_to_process:
+            task_key = f"{model_name}/{vocabulary}"
+            if check_embeddings_exist(model_name, vocabulary):
+                tasks_to_skip.append(task_key)
+                print(f"  ✓ {task_key}: Embeddings already exist (skipping)")
+            else:
+                tasks_to_compute.append((model_name, vocabulary))
+                print(f"  • {task_key}: Will compute embeddings")
     
-    if not models_to_compute:
+    if not tasks_to_compute:
         print("\n" + "="*80)
         print("All requested embeddings already exist. Nothing to compute.")
         print(f"Embeddings location: {OUTPUT_DIR.absolute()}")
         print("="*80)
         return
     
-    print(f"\nModels to compute: {len(models_to_compute)}/{len(models_to_process)}")
-    
-    text_input = load_concepts(CONCEPTS_FILE_PATH, args.vocabulary)
-    
-    if len(text_input) == 0:
-        print(f"Error: No concepts found for vocabulary '{args.vocabulary}'")
-        return
+    print(f"\nTasks to compute: {len(tasks_to_compute)}")
+    print(f"Tasks to skip: {len(tasks_to_skip)}")
     
     OUTPUT_DIR.mkdir(exist_ok=True)
     
+    # Process each model-vocabulary combination
     import time
-    for model_name in models_to_compute:
+    total_start = time.time()
+    successful_tasks = 0
+    failed_tasks = []
+    
+    for idx, (model_name, vocabulary) in enumerate(tasks_to_compute, 1):
+        print(f"\n{'='*80}")
+        print(f"Task {idx}/{len(tasks_to_compute)}: {model_name.upper()} + {vocabulary}")
+        print(f"{'='*80}")
+        
         try:
+            # Load concepts for this vocabulary
+            text_input = load_concepts(CONCEPTS_FILE_PATH, vocabulary)
+            
+            if len(text_input) == 0:
+                print(f"Warning: No concepts found for vocabulary '{vocabulary}' - skipping")
+                failed_tasks.append(f"{model_name}/{vocabulary} (no concepts)")
+                continue
+            
+            # Compute embeddings
             start_time = time.time()
             embeddings = precompute_embeddings_for_model(
                 model_name, 
@@ -341,20 +392,33 @@ def main():
                 MODELS_CONFIG,
                 use_parallel=args.parallel
             )
-            save_embeddings(model_name, embeddings, args.vocabulary)
+            
+            # Save embeddings
+            save_embeddings(model_name, embeddings, vocabulary)
+            
             elapsed = time.time() - start_time
-            print(f"✓ Successfully processed {model_name} in {elapsed:.2f} seconds")
+            print(f"✓ Successfully processed {model_name}/{vocabulary} in {elapsed:.2f} seconds")
+            successful_tasks += 1
+            
         except Exception as e:
-            print(f"✗ Error processing {model_name}: {str(e)}")
+            print(f"✗ Error processing {model_name}/{vocabulary}: {str(e)}")
+            failed_tasks.append(f"{model_name}/{vocabulary}")
             import traceback
             traceback.print_exc()
             continue
     
+    # Final summary
+    total_elapsed = time.time() - total_start
     print("\n" + "="*80)
     print("Pre-computation complete!")
+    print(f"Total time: {total_elapsed:.2f} seconds")
+    print(f"Successful: {successful_tasks}/{len(tasks_to_compute)}")
+    if failed_tasks:
+        print(f"Failed: {len(failed_tasks)}")
+        print(f"Failed tasks: {', '.join(failed_tasks)}")
+    if tasks_to_skip:
+        print(f"Skipped {len(tasks_to_skip)} task(s) with existing embeddings")
     print(f"Embeddings saved to: {OUTPUT_DIR.absolute()}")
-    if models_to_skip:
-        print(f"Skipped {len(models_to_skip)} model(s) with existing embeddings: {models_to_skip}")
     print("="*80)
 
 

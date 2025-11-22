@@ -1,5 +1,6 @@
 """
-Pre-compute embeddings for ICD-10 codes and save them to disk.
+Pre-compute embeddings for biomedical concept codes and save them to disk.
+Supports multiple vocabularies and models.
 """
 
 from sentence_transformers import SentenceTransformer
@@ -8,7 +9,6 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import torch
-import pickle
 import json
 from pathlib import Path
 import warnings
@@ -18,12 +18,10 @@ import argparse
 
 warnings.filterwarnings('ignore')
 
-# Load configuration from JSON file
 CONFIG_FILE = './models/config.json'
-ICD10_FILE_PATH = "./data/icd10_codes.csv"
-OUTPUT_DIR = Path('./precomputed_embeddings')
+CONCEPTS_FILE_PATH = "./data/concepts_bridge_appsubset.parquet"
+OUTPUT_DIR = Path('./embeddings')
 
-# === CPU Thread Optimization ===
 cpu_cores = os.cpu_count()
 torch.set_num_threads(cpu_cores)
 torch.set_num_interop_threads(cpu_cores)
@@ -43,47 +41,60 @@ def load_config():
         raise ValueError(f"Configuration file '{CONFIG_FILE}' is not valid JSON")
 
 
-def check_embeddings_exist(model_name, icd_chars):
-    """Check if embeddings already exist for this model and ICD character length"""
-    model_dir = OUTPUT_DIR / model_name / f"icd{icd_chars}"
-    embeddings_file = model_dir / 'embeddings.parquet'
+def check_embeddings_exist(model_name, vocabulary):
+    """Check if embeddings already exist for this model and vocabulary"""
+    model_dir = OUTPUT_DIR / model_name / vocabulary
+    embeddings_file = model_dir / 'embeddings.npy'
     return embeddings_file.exists()
 
 
-def load_icd10_codes(filepath, icd_chars=3):
-    """Load ICD-10-CM codes filtered by character length"""
-    print(f"Loading ICD-10 codes from {filepath}...")
-    print(f"Filtering for codes with {icd_chars} characters...")
-    icd_df = pd.read_csv(filepath)
+def get_available_vocabularies(filepath):
+    """Get all unique vocabularies from the concepts file"""
+    try:
+        concepts_df = pd.read_parquet(filepath)
+        return sorted(concepts_df['vocabulary'].unique().tolist())
+    except Exception as e:
+        print(f"Warning: Could not read vocabularies from {filepath}: {e}")
+        return []
 
-    code_col = 'Code'
-    desc_col = 'LongDescription'
 
-    if code_col not in icd_df.columns or desc_col not in icd_df.columns:
-        raise ValueError(f"Expected columns '{code_col}' and '{desc_col}' not found.")
-
-    # Filter by exact code length
-    icd_df = icd_df[icd_df[code_col].str.len() == icd_chars]
-
-    codes = icd_df[code_col].tolist()
-    descriptions = icd_df[desc_col].tolist()
-    # Combine medical vocabulary, code and description in one unique string
-    combined_input = [f"[ICD-10-CM: {code}, {desc}]" for code, desc in zip(codes, descriptions)]
-
-    print(f"Loaded {len(codes)} ICD-10-CM codes with {icd_chars} characters")
-    return combined_input
+def load_concepts(filepath, vocabulary='OMOP'):
+    """Load concepts filtered by vocabulary and remove duplicates"""
+    print(f"Loading concepts from {filepath}...")
+    print(f"Filtering for vocabulary: {vocabulary}")
+    
+    concepts_df = pd.read_parquet(filepath)
+    
+    required_cols = {'vocabulary', 'code', 'name'}
+    if not required_cols.issubset(concepts_df.columns):
+        raise ValueError(f"Expected columns {required_cols} not found in {filepath}")
+    
+    concepts_df = concepts_df[concepts_df['vocabulary'] == vocabulary]
+    
+    print(f"Found {len(concepts_df)} concepts before deduplication")
+    concepts_df = concepts_df.drop_duplicates(subset=['vocabulary', 'code', 'name'])
+    print(f"After removing duplicates: {len(concepts_df)} concepts")
+    
+    codes = concepts_df['code'].tolist()
+    # names = concepts_df['name'].tolist()
+    
+    text_input = [f"[{vocab}: {code}]" for vocab, code in zip(concepts_df['vocabulary'], codes)]
+    # text_input = [f"[{vocab}: {code}, {name}]" for vocab, code, name in zip(concepts_df['vocabulary'], codes, names)]
+    # text_input = names
+    # text_input = codes
+    
+    print(f"Loaded {len(text_input)} unique concepts from vocabulary '{vocabulary}'")
+    return text_input
 
 
 def _process_transformer_chunk(args):
     """Process a chunk of texts in a separate process"""
     texts, model_name, tokenizer_name, batch_size, chunk_idx = args
     
-    # Load model in worker process
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     model = AutoModel.from_pretrained(model_name)
     model.eval()
     
-    # Optimize threads per worker
     torch.set_num_threads(max(1, cpu_cores // 4))
     
     all_embeddings = []
@@ -101,7 +112,6 @@ def _process_transformer_chunk(args):
         with torch.no_grad():
             output = model(**encoded)
         
-        # Mean pooling
         attention_mask = encoded['attention_mask'].unsqueeze(-1)
         masked_embeddings = output.last_hidden_state * attention_mask
         summed = masked_embeddings.sum(dim=1)
@@ -121,17 +131,14 @@ def get_transformer_embeddings_parallel(texts, model_name, tokenizer_name, batch
     print(f"PyTorch using {torch.get_num_threads()} threads")
     print(f"Using {num_workers} parallel workers with batch size {batch_size}")
     
-    # Split texts into chunks for parallel processing
     chunk_size = (len(texts) + num_workers - 1) // num_workers
     text_chunks = [texts[i:i+chunk_size] for i in range(0, len(texts), chunk_size)]
     
-    # Prepare arguments for each worker
     worker_args = [
         (chunk, model_name, tokenizer_name, batch_size, idx)
         for idx, chunk in enumerate(text_chunks)
     ]
     
-    # Process in parallel
     with mp.Pool(num_workers) as pool:
         results = pool.map(_process_transformer_chunk, worker_args)
     
@@ -156,7 +163,6 @@ def get_transformer_embeddings(texts, model, tokenizer, batch_size=64):
         with torch.no_grad():
             output = model(**encoded)
 
-        # Mean pooling
         attention_mask = encoded['attention_mask'].unsqueeze(-1)
         masked_embeddings = output.last_hidden_state * attention_mask
         summed = masked_embeddings.sum(dim=1)
@@ -178,7 +184,7 @@ def get_sentence_transformer_embeddings(texts, model, batch_size=64):
     )
 
 
-def precompute_embeddings_for_model(model_name, combined_input, config, use_parallel=True):
+def precompute_embeddings_for_model(model_name, text_input, config, use_parallel=True):
     """Pre-compute embeddings for a specific model"""
     print(f"\n{'='*80}")
     print(f"Processing model: {model_name.upper()}")
@@ -186,28 +192,25 @@ def precompute_embeddings_for_model(model_name, combined_input, config, use_para
     
     model_config = config[model_name]
     
-    # Load model based on type
     if model_config['type'] == 'transformer':
         print(f"Loading {model_name}...")
         
         if use_parallel:
-            # Use parallel processing
             print("Generating embeddings with parallel processing...")
-            combined_input_embeddings = get_transformer_embeddings_parallel(
-                combined_input,
+            embeddings = get_transformer_embeddings_parallel(
+                text_input,
                 model_config['model'],
                 model_config['tokenizer'],
                 batch_size=256,
                 num_workers=4
             )
         else:
-            # Use single process with larger batch size
             tokenizer = AutoTokenizer.from_pretrained(model_config['tokenizer'])
             model = AutoModel.from_pretrained(model_config['model'])
             
             print("Generating embeddings (single process)...")
-            combined_input_embeddings = get_transformer_embeddings(
-                combined_input, model, tokenizer, batch_size=64
+            embeddings = get_transformer_embeddings(
+                text_input, model, tokenizer, batch_size=64
             )
         
     elif model_config['type'] == 'sentence_transformer':
@@ -215,39 +218,41 @@ def precompute_embeddings_for_model(model_name, combined_input, config, use_para
         model = SentenceTransformer(model_config['path'])
         
         print("Generating embeddings...")
-        combined_input_embeddings = get_sentence_transformer_embeddings(
-            combined_input, model, batch_size=64
+        embeddings = get_sentence_transformer_embeddings(
+            text_input, model, batch_size=64
         )
     
     else:
         raise ValueError(f"Unknown model type: {model_config['type']}")
     
-    return combined_input_embeddings
+    return embeddings
 
 
-def save_embeddings(model_name, combined_input_embeddings, icd_chars):
-    """Save embeddings and metadata to disk"""
-    model_dir = OUTPUT_DIR / model_name / f"icd{icd_chars}"
+def save_embeddings(model_name, embeddings, vocabulary):
+    """Save embeddings as numpy array"""
+    model_dir = OUTPUT_DIR / model_name / vocabulary
     model_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save embeddings as parquet
-    df = pd.DataFrame(combined_input_embeddings)
-    df.to_parquet(model_dir / 'embeddings.parquet', index=False)
-    print(f"Saved embeddings: shape {combined_input_embeddings.shape}")
-    print(f"Location: {model_dir / 'embeddings.parquet'}")
+    embeddings_path = model_dir / 'embeddings.npy'
+    np.save(embeddings_path, embeddings)
+    
+    print(f"Saved embeddings: shape {embeddings.shape}")
+    print(f"Location: {embeddings_path}")
 
 
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='Pre-compute embeddings for ICD-10 codes',
+        description='Pre-compute embeddings for biomedical concept codes',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python PreComputeEmbeddings.py
-  python PreComputeEmbeddings.py --model bridge --icd_chars 4
-  python PreComputeEmbeddings.py --model all --icd_chars 3 --parallel
-  python PreComputeEmbeddings.py --model bridge gatortron --icd_chars 5 --no-parallel
+  python PreComputeEmbeddings.py --model bridge --vocabulary ICD10CM
+  python PreComputeEmbeddings.py --model all --vocabulary OMOP ATC ICD10CM --parallel
+  python PreComputeEmbeddings.py --model bridge gatortron --vocabulary ATC --no-parallel
+  python PreComputeEmbeddings.py --vocabulary all --model bridge
+  python PreComputeEmbeddings.py --model all --vocabulary all --parallel
         """
     )
     
@@ -259,10 +264,10 @@ Examples:
     )
     
     parser.add_argument(
-        '--icd_chars',
-        type=int,
-        default=3,
-        help='Number of characters for ICD code filtering (default: 3)'
+        '--vocabulary',
+        nargs='+',
+        default=['OMOP'],
+        help='Vocabulary/vocabularies to filter concepts. Use "all" for all vocabularies, or specify vocabulary names (default: OMOP)'
     )
     
     parser.add_argument(
@@ -284,27 +289,24 @@ Examples:
 
 def main():
     """Main pre-computation pipeline"""
-    # Parse arguments
     args = parse_arguments()
     
-    print("ICD-10-CM Embedding Pre-computation Pipeline")
+    print("Biomedical Concept Embedding Pre-computation Pipeline")
     print("="*80)
     print(f"Configuration:")
-    print(f"  - ICD Characters: {args.icd_chars}")
+    print(f"  - Vocabularies: {args.vocabulary}")
     print(f"  - Parallel Processing: {args.parallel}")
     print(f"  - Requested Models: {args.model}")
     print("="*80)
     
-    # Load configuration
     MODELS_CONFIG = load_config()
     
-    # Determine which models to process
+    # Handle model selection
     if 'all' in args.model:
         models_to_process = list(MODELS_CONFIG.keys())
         print(f"Processing all available models: {models_to_process}")
     else:
         models_to_process = args.model
-        # Validate requested models
         invalid_models = [m for m in models_to_process if m not in MODELS_CONFIG]
         if invalid_models:
             print(f"Warning: Unknown models will be skipped: {invalid_models}")
@@ -315,67 +317,112 @@ def main():
             print(f"Available models: {list(MODELS_CONFIG.keys())}")
             return
     
-    # Check for existing embeddings and filter models to process
+    # Handle vocabulary selection
+    available_vocabularies = get_available_vocabularies(CONCEPTS_FILE_PATH)
+    
+    if 'all' in args.vocabulary:
+        vocabularies_to_process = available_vocabularies
+        print(f"\nProcessing all available vocabularies: {vocabularies_to_process}")
+    else:
+        vocabularies_to_process = args.vocabulary
+        invalid_vocabs = [v for v in vocabularies_to_process if v not in available_vocabularies]
+        if invalid_vocabs:
+            print(f"\nWarning: Unknown vocabularies will be skipped: {invalid_vocabs}")
+            print(f"Available vocabularies: {available_vocabularies}")
+        vocabularies_to_process = [v for v in vocabularies_to_process if v in available_vocabularies]
+        
+        if not vocabularies_to_process:
+            print("Error: No valid vocabularies specified")
+            print(f"Available vocabularies: {available_vocabularies}")
+            return
+    
+    print(f"\nVocabularies to process: {vocabularies_to_process}")
+    
+    # Check for existing embeddings
     print("\nChecking for existing embeddings...")
-    models_to_skip = []
-    models_to_compute = []
+    tasks_to_skip = []
+    tasks_to_compute = []
     
     for model_name in models_to_process:
-        if check_embeddings_exist(model_name, args.icd_chars):
-            models_to_skip.append(model_name)
-            print(f"  ✓ {model_name}: Embeddings already exist (skipping)")
-        else:
-            models_to_compute.append(model_name)
-            print(f"  • {model_name}: Will compute embeddings")
+        for vocabulary in vocabularies_to_process:
+            task_key = f"{model_name}/{vocabulary}"
+            if check_embeddings_exist(model_name, vocabulary):
+                tasks_to_skip.append(task_key)
+                print(f"  ✓ {task_key}: Embeddings already exist (skipping)")
+            else:
+                tasks_to_compute.append((model_name, vocabulary))
+                print(f"  • {task_key}: Will compute embeddings")
     
-    if not models_to_compute:
+    if not tasks_to_compute:
         print("\n" + "="*80)
         print("All requested embeddings already exist. Nothing to compute.")
         print(f"Embeddings location: {OUTPUT_DIR.absolute()}")
         print("="*80)
         return
     
-    print(f"\nModels to compute: {len(models_to_compute)}/{len(models_to_process)}")
+    print(f"\nTasks to compute: {len(tasks_to_compute)}")
+    print(f"Tasks to skip: {len(tasks_to_skip)}")
     
-    # Load ICD-10 codes only if we have models to process
-    combined_input = load_icd10_codes(ICD10_FILE_PATH, args.icd_chars)
-    
-    if len(combined_input) == 0:
-        print(f"Error: No ICD-10 codes found with {args.icd_chars} characters")
-        return
-    
-    # Create output directory
     OUTPUT_DIR.mkdir(exist_ok=True)
     
-    # Process each model
+    # Process each model-vocabulary combination
     import time
-    for model_name in models_to_compute:
+    total_start = time.time()
+    successful_tasks = 0
+    failed_tasks = []
+    
+    for idx, (model_name, vocabulary) in enumerate(tasks_to_compute, 1):
+        print(f"\n{'='*80}")
+        print(f"Task {idx}/{len(tasks_to_compute)}: {model_name.upper()} + {vocabulary}")
+        print(f"{'='*80}")
+        
         try:
+            # Load concepts for this vocabulary
+            text_input = load_concepts(CONCEPTS_FILE_PATH, vocabulary)
+            
+            if len(text_input) == 0:
+                print(f"Warning: No concepts found for vocabulary '{vocabulary}' - skipping")
+                failed_tasks.append(f"{model_name}/{vocabulary} (no concepts)")
+                continue
+            
+            # Compute embeddings
             start_time = time.time()
             embeddings = precompute_embeddings_for_model(
                 model_name, 
-                combined_input,
+                text_input,
                 MODELS_CONFIG,
                 use_parallel=args.parallel
             )
-            save_embeddings(model_name, embeddings, args.icd_chars)
+            
+            # Save embeddings
+            save_embeddings(model_name, embeddings, vocabulary)
+            
             elapsed = time.time() - start_time
-            print(f"✓ Successfully processed {model_name} in {elapsed:.2f} seconds")
+            print(f"✓ Successfully processed {model_name}/{vocabulary} in {elapsed:.2f} seconds")
+            successful_tasks += 1
+            
         except Exception as e:
-            print(f"✗ Error processing {model_name}: {str(e)}")
+            print(f"✗ Error processing {model_name}/{vocabulary}: {str(e)}")
+            failed_tasks.append(f"{model_name}/{vocabulary}")
             import traceback
             traceback.print_exc()
             continue
     
+    # Final summary
+    total_elapsed = time.time() - total_start
     print("\n" + "="*80)
     print("Pre-computation complete!")
+    print(f"Total time: {total_elapsed:.2f} seconds")
+    print(f"Successful: {successful_tasks}/{len(tasks_to_compute)}")
+    if failed_tasks:
+        print(f"Failed: {len(failed_tasks)}")
+        print(f"Failed tasks: {', '.join(failed_tasks)}")
+    if tasks_to_skip:
+        print(f"Skipped {len(tasks_to_skip)} task(s) with existing embeddings")
     print(f"Embeddings saved to: {OUTPUT_DIR.absolute()}")
-    if models_to_skip:
-        print(f"Skipped {len(models_to_skip)} model(s) with existing embeddings: {models_to_skip}")
     print("="*80)
 
 
 if __name__ == '__main__':
-    # Required for multiprocessing
     mp.set_start_method('spawn', force=True)
     main()

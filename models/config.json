@@ -5,6 +5,11 @@
       "model": "UFNLP/gatortron-base",
       "type": "transformer"
     },
+    "sapbert": {
+      "tokenizer": "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+      "model": "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+      "type": "transformer"
+    },
     "bridge": {
       "path": "./models/Embedding-SBERT-CLIP-256-Full-woGraph-woCandidate-STRONG/sbert/",
       "type": "sentence_transformer"

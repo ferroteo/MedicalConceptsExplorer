@@ -1,9 +1,3 @@
-"""
-Enhanced Streamlit app for biomedical ontology retrieval on Hugging Face
-Supports multiple vocabularies with precomputed embeddings and t-SNE visualization
-Now supports multiple embedding models: BRIDGE, SapBERT, and GatorTron
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.manifold import TSNE
 import altair as alt
 import toml
+from openai import OpenAI
 
 # Model configuration
 MODELS_CONFIG = {
@@ -29,6 +24,11 @@ MODELS_CONFIG = {
         "type": "transformer",
         "tokenizer": "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
         "model": "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+    },
+    "openai": {
+        "display_name": "OpenAI",
+        "type": "openai",
+        "model": "text-embedding-3-large"
     }
 }
 
@@ -51,6 +51,31 @@ def get_hf_token():
         except:
             pass
     return token
+
+def get_openai_key():
+    """Get OpenAI API key from environment or secrets"""
+    key = os.getenv("OPENAI_KEY")
+    if not key:
+        try:
+            for secrets_path in ["/root/.streamlit/secrets.toml", "/app/.streamlit/secrets.toml", "/app/src/.streamlit/secrets.toml"]:
+                if os.path.exists(secrets_path):
+                    secrets = toml.load(secrets_path)
+                    key = secrets.get("OPENAI_KEY")
+                    if key:
+                        break
+            if not key:
+                key = st.secrets.get("OPENAI_KEY")
+        except:
+            pass
+    return key
+
+@st.cache_resource
+def get_openai_client():
+    """Create a cached OpenAI client"""
+    api_key = get_openai_key()
+    if not api_key:
+        raise RuntimeError("No OPENAI_KEY found in environment or secrets.")
+    return OpenAI(api_key=api_key)
 
 # Configuration
 HF_USERNAME = "dsgelab"
@@ -88,22 +113,29 @@ def load_concepts():
         raise
 
 @st.cache_data
-def load_embeddings(vocabulary, model_name):
-    """Load precomputed embeddings for a specific vocabulary and model from Hugging Face dataset"""
+def load_embeddings(vocabulary, model_name, which):
+    """Load precomputed embeddings for a specific vocabulary, model, and embedding type from Hugging Face dataset"""
     try:
         hf_token = get_hf_token()
         
-        # Download the embeddings file for this vocabulary and model
+        if which == "vc":
+            emb_file = "embeddings_codes.npy"
+        elif which == "name":
+            emb_file = "embeddings_names.npy"
+        else:
+            raise ValueError(f"Unknown embedding type: {which}")
+        
+        # Download the embeddings file for this vocabulary, model, and embedding type
         file_path = hf_hub_download(
             repo_id=DATASET_REPO,
-            filename=f"embeddings/{model_name}/{vocabulary}/embeddings.npy",
+            filename=f"embeddings/{model_name}/{vocabulary}/{emb_file}",
             repo_type="dataset",
             token=hf_token
         )
         embeddings = np.load(file_path)
         return embeddings
     except Exception as e:
-        st.error(f"Error loading embeddings for {vocabulary} with {model_name}: {e}")
+        st.error(f"Error loading embeddings for {vocabulary} with {model_name} ({which}): {e}")
         raise
 
 @st.cache_resource
@@ -178,6 +210,19 @@ def get_user_embedding_sentence_transformer(text, model):
     embedding = model.encode([text], convert_to_numpy=True, device=device)
     return embedding
 
+def get_user_embedding_openai(text, model_name):
+    """Generate embedding for user input text using OpenAI embeddings"""
+    config = MODELS_CONFIG[model_name]
+    model_id = config["model"]
+    client = get_openai_client()
+    resp = client.embeddings.create(
+        model=model_id,
+        input=[text],
+    )
+    # resp.data is a list with one item per input
+    vec = np.array(resp.data[0].embedding, dtype=np.float32)[None, :]
+    return vec
+
 def get_user_embedding(text, model_name):
     """Generate embedding for user input text based on model type"""
     config = MODELS_CONFIG[model_name]
@@ -185,9 +230,13 @@ def get_user_embedding(text, model_name):
     if config["type"] == "sentence_transformer":
         model = load_sentence_transformer_model(model_name)
         return get_user_embedding_sentence_transformer(text, model)
-    else:  # transformer
+    elif config["type"] == "transformer":
         tokenizer, model = load_transformer_model(model_name)
         return get_user_embedding_transformer(text, tokenizer, model)
+    elif config["type"] == "openai":
+        return get_user_embedding_openai(text, model_name)
+    else:
+        raise ValueError(f"Unknown model type: {config['type']}")
 
 def find_similar_concepts(user_text, df_concepts, embeddings_dict, model_name, top_n=30):
     """Find most similar biomedical concepts across vocabularies"""
@@ -333,12 +382,14 @@ def compute_tsne_plot(df_concepts, embeddings_dict, query_embedding, selected_vo
 def main():
     st.set_page_config(page_title="Biomedical Ontology Retrieval", layout="wide")
     
-    st.title("🧬 Biomedical Ontology Retrieval")
+    st.title("Biomedical Ontology Retrieval")
     st.markdown("Find similar concepts across multiple biomedical vocabularies using state-of-the-art embeddings")
     
     # Check for HF token
     if not get_hf_token():
         st.warning("⚠️ No Hugging Face token found. If your repos are private, add HF_TOKEN as a repository secret.")
+    
+    # Check for OpenAI key (only warn if OpenAI model is chosen later)
     
     # Load data
     with st.spinner("Loading concepts and embeddings from Hugging Face..."):
@@ -364,11 +415,26 @@ def main():
     
     selected_model_name = MODELS_CONFIG[selected_model_key]["display_name"]
     
-    # Vocabulary selection
+    if MODELS_CONFIG[selected_model_key]["type"] == "openai" and not get_openai_key():
+        st.sidebar.warning("⚠️ No OpenAI key found (OPENAI_KEY). OpenAI queries will fail.")
+    
+    # Embedding type selection (vc vs name)
+    emb_type_label = st.sidebar.radio(
+        "Retrieve From",
+        options=["Codes", "Names"],
+        index=0,
+        help="Choose whether to retrieve against embeddings computed from the code+vocabulary text or from the concept name text"
+    )
+    if emb_type_label == "Codes":
+        emb_type = "vc"
+    else:
+        emb_type = "name"
+    
+    # Vocabulary selection (no defaults selected)
     selected_vocabs = st.sidebar.multiselect(
         "Vocabularies",
         available_vocabs,
-        default=available_vocabs,
+        default=[],
         help="Select which biomedical vocabularies to search"
     )
     
@@ -376,14 +442,14 @@ def main():
         st.error("Please select at least one vocabulary.")
         st.stop()
     
-    # Load embeddings for selected vocabularies and model
-    with st.spinner(f"Loading {selected_model_name} embeddings for selected vocabularies..."):
+    # Load embeddings for selected vocabularies, model, and embedding type
+    with st.spinner(f"Loading {selected_model_name} embeddings ({emb_type}) for selected vocabularies..."):
         embeddings_dict = {}
         failed_vocabs = []
         
         for vocab in selected_vocabs:
             try:
-                embeddings_dict[vocab] = load_embeddings(vocab, selected_model_key)
+                embeddings_dict[vocab] = load_embeddings(vocab, selected_model_key, emb_type)
             except Exception as e:
                 failed_vocabs.append(vocab)
                 st.warning(f"Could not load {selected_model_name} embeddings for {vocab}")
@@ -414,7 +480,7 @@ def main():
     # Info in sidebar
     st.sidebar.success(f"✓ Loaded {len(df_concepts)} concepts")
     st.sidebar.info(f"📊 Active vocabularies: {len(selected_vocabs)}")
-    st.sidebar.info(f"🤖 Model: {selected_model_name}\n💻 Device: {device}")
+    st.sidebar.info(f"Model: {selected_model_name}\n Device: {device}")
     
     # Display vocabulary statistics
     with st.sidebar.expander("📈 Vocabulary Statistics"):
@@ -426,7 +492,7 @@ def main():
     st.subheader("🔍 Query")
     user_input = st.text_area(
         "Enter clinical or biomedical text:",
-        placeholder="e.g., Migraine with aura",
+        placeholder="e.g. \"Migraine with aura\" or \"ICD10 G43.1\"",
         height=120,
         help="Enter any clinical description or biomedical concept to find similar codes"
     )

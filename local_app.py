@@ -139,7 +139,6 @@ class BioMistral:
     def __init__(self, path, device="cuda"):
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(path, cache_dir="Models")
-        # ensure we have a pad token
         if self.tokenizer.pad_token is None:
             # many Mistral/LLaMA-style tokenizers use eos as pad
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -176,7 +175,7 @@ class BioMistral:
 # APP CONFIG
 # -----------
 
-DATA_PARQUET = Path("concepts_bridge_processed.parquet")
+DATA_PARQUET = Path("./data/concepts_bridge.parquet")
 EMB_DIR = Path("./embeddings")
 MODEL_TO_PREFIX = {
     "BRIDGE": "bridge",
@@ -192,7 +191,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 @st.cache_data
 def load_df() -> pd.DataFrame:
     df = pd.read_parquet(DATA_PARQUET)
-    needed = {"vocabulary", "code", "name", "text_vc", "text_name"}
+    needed = {"vocabulary", "code", "name"}
     missing = needed - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in parquet: {missing}")
@@ -200,13 +199,11 @@ def load_df() -> pd.DataFrame:
 
 
 @st.cache_resource
-def load_embedding_array(model_label: str, which: str) -> np.ndarray:
-    assert which in ("vc", "name")
+def load_embedding_array(model_label: str, vocabulary: str) -> np.ndarray:
     prefix = MODEL_TO_PREFIX[model_label]
-    path = EMB_DIR / f"{prefix}_{which}.npy"
+    path = EMB_DIR / prefix / vocabulary / "embeddings.npy"
     if not path.exists():
         raise FileNotFoundError(f"Expected embedding file not found: {path}")
-    # memory-mapped, read-only
     arr = np.load(path, mmap_mode="r")
     return arr
 
@@ -309,12 +306,6 @@ def main():
 
     model_label = st.sidebar.selectbox("Model", list(MODEL_TO_PREFIX.keys()), index=0)
 
-    retrieval_source = st.sidebar.radio(
-        "Retrieve from",
-        ["Codes", "Names"],
-        index=0,
-    )
-
     all_vocabs = sorted(df["vocabulary"].unique().tolist())
     selected_vocabs = st.sidebar.multiselect("Vocabularies", all_vocabs, default=all_vocabs)
     if not selected_vocabs:
@@ -323,15 +314,27 @@ def main():
 
     top_k = st.sidebar.slider("Top-K", 1, 200, 30, 1)
 
-    if retrieval_source == "Codes":
-        emb_arr = load_embedding_array(model_label, "vc")
-    else:
-        emb_arr = load_embedding_array(model_label, "name")
-
     mask = df["vocabulary"].isin(selected_vocabs)
-    df_sub = df[mask].reset_index(drop=True)
-    idx = np.where(mask.values)[0]
-    emb_sub = emb_arr[idx]
+    df_sub = df[mask].drop_duplicates(subset=['vocabulary', 'code', 'name']).reset_index(drop=True)
+    
+    emb_list = []
+    for vocab in selected_vocabs:
+        try:
+            vocab_mask = df_sub["vocabulary"] == vocab
+            vocab_df = df_sub[vocab_mask]
+            
+            emb_arr = load_embedding_array(model_label, vocab)
+            
+            if len(vocab_df) != len(emb_arr):
+                st.error(f"Mismatch: {vocab} has {len(vocab_df)} concepts but {len(emb_arr)} embeddings")
+                return
+            
+            emb_list.append(emb_arr)
+        except FileNotFoundError as e:
+            st.error(f"Embeddings not found for {model_label} + {vocab}. Please run PreComputeEmbeddings.py first.")
+            return
+    
+    emb_sub = np.vstack(emb_list)
 
     st.subheader("Query")
     query = st.text_area("Enter text to retrieve similar concepts", "", height=120)
